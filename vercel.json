@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "functions": {
+    "api/research.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
+}
