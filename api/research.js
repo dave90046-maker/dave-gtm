@@ -26,10 +26,10 @@ export default async function handler(req, res) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
+      max_tokens: 1300,
       messages: [{
         role: 'user',
-        content: `You are a B2B marketing strategist. Generate a concise ICP research brief for "${company}". Use these exact headers:\n\nCOMPANY OVERVIEW\nBUYER PERSONA\nTOP PAIN POINTS\nOUTREACH ANGLE\nMARKETING CHANNEL FIT\n\nKeep it under 350 words. Be specific and actionable.`
+        content: `You are a B2B marketing strategist. Generate a concise ICP research brief for "${company}". Use these exact headers:\n\nCOMPANY OVERVIEW\nBUYER PERSONA\nTOP PAIN POINTS\nOUTREACH ANGLE\nMARKETING CHANNEL FIT\nCOMPETITIVE LANDSCAPE\n\nFor COMPETITIVE LANDSCAPE, identify 3-4 key competitors of the company, with one line on how each one differs from it, plus a closing sentence on how to position against them in outreach.\n\nKeep it under 450 words. Be specific and actionable.`
       }]
     })
   });
