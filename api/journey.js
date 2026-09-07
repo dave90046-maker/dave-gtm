@@ -1,3 +1,13 @@
+const SUBJECT_LINE_MAX = 50;
+
+function truncateSubjectLine(text, maxLength) {
+  if (text.length <= maxLength) return text;
+  const cut = text.slice(0, maxLength - 1);
+  const lastSpace = cut.lastIndexOf(' ');
+  const safeCut = lastSpace > maxLength * 0.6 ? cut.slice(0, lastSpace) : cut;
+  return safeCut.trimEnd() + '…';
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -57,6 +67,7 @@ export default async function handler(req, res) {
 
   journey.stages.forEach(stage => {
     if (typeof stage.subject_line === 'string') {
+      stage.subject_line = truncateSubjectLine(stage.subject_line, SUBJECT_LINE_MAX);
       stage.subject_line_length = stage.subject_line.length;
     }
   });
