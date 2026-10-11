@@ -1,6 +1,9 @@
 const MAX_PAGES = 5;
 const PAGE_TIMEOUT_MS = 5000;
+const BRAVE_TIMEOUT_MS = 6000;
+const FIRST_PARTY_PHASE_TIMEOUT_MS = 15000;
 const MAX_CHARS_PER_PAGE = 3000;
+const MAX_HTML_LENGTH = 600000;
 const SOFT_DUPLICATE_THRESHOLD = 0.85;
 
 const AGGREGATOR_BLOCKLIST = [
@@ -39,9 +42,12 @@ const TEAM_PATH_FALLBACKS = ['/team', '/our-team', '/leadership', '/people'];
 const NEWS_PATH_FALLBACKS = ['/news', '/insights', '/blog', '/press'];
 
 async function braveSearch(query) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), BRAVE_TIMEOUT_MS);
   try {
     const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}`;
     const response = await fetch(url, {
+      signal: controller.signal,
       headers: {
         Accept: 'application/json',
         'X-Subscription-Token': process.env.BRAVE_API_KEY
@@ -58,6 +64,8 @@ async function braveSearch(query) {
     }));
   } catch (err) {
     return [];
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -137,7 +145,7 @@ async function fetchWithTimeout(url, timeoutMs) {
     });
     if (!response.ok) return null;
     const html = await response.text();
-    return { finalUrl: response.url || url, html };
+    return { finalUrl: response.url || url, html: html.length > MAX_HTML_LENGTH ? html.slice(0, MAX_HTML_LENGTH) : html };
   } catch {
     return null;
   } finally {
@@ -288,6 +296,13 @@ function buildSecondaryContext(linkedinResults, newsResults) {
   return `SECONDARY SOURCES (search snippets, aggregators, news, social — use to supplement first-party content or surface recent external signals, never to override it):\n\n${body}`;
 }
 
+function withTimeout(promise, ms, fallbackValue) {
+  return Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => resolve(fallbackValue), ms))
+  ]);
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -307,37 +322,49 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Company name required' });
   }
 
-  const [linkedinResults, newsResults, domain] = await Promise.all([
-    braveSearch(`${company} site:linkedin.com`),
-    braveSearch(`${company} news`),
-    discoverDomain(company)
-  ]);
+  try {
+    const [linkedinResults, newsResults, domain] = await Promise.all([
+      braveSearch(`${company} site:linkedin.com`),
+      braveSearch(`${company} news`),
+      discoverDomain(company)
+    ]);
 
-  const firstPartyPages = domain ? await fetchFirstPartyPages(domain) : [];
+    const firstPartyPages = domain
+      ? await withTimeout(fetchFirstPartyPages(domain), FIRST_PARTY_PHASE_TIMEOUT_MS, [])
+      : [];
 
-  const sourceContext = [
-    buildFirstPartyContext(firstPartyPages),
-    buildSecondaryContext(linkedinResults, newsResults)
-  ].join('\n\n');
+    const sourceContext = [
+      buildFirstPartyContext(firstPartyPages),
+      buildSecondaryContext(linkedinResults, newsResults)
+    ].join('\n\n');
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 4096,
-      messages: [{
-        role: 'user',
-        content: `You are a senior competitive intelligence analyst briefing a sales or marketing professional ahead of a call or campaign targeting "${company}". You have two tiers of source material below.\n\n${sourceContext}\n\nSOURCE RULES (apply throughout the brief):\n- Treat FIRST-PARTY content as the authoritative source of truth for names, titles, founding date, and services. Use SECONDARY sources only to fill gaps FIRST-PARTY content doesn't cover, or to surface recent external news/signals FIRST-PARTY content wouldn't contain.\n- Copy job titles exactly as written on FIRST-PARTY pages, character for character. Never paraphrase, shorten, or invent a title — if the site says "Principal and Chief Investment Officer," do not write "CIO" or "Managing Principal" instead.\n- Every named person and every key fact (founding date, leadership titles, specific services) needs a short inline citation in parentheses immediately after it, in exactly this format: "(First-party: <citation>)" or "(Secondary: <SourceName>)" — using the exact citation references given alongside each source above. Never cite a fact without one of these two formats.\n- If a fact cannot be confirmed from the sources above or your own reliable knowledge, write "Unknown" or "Not confirmed" rather than guessing.\n- If a SECONDARY source conflicts with a FIRST-PARTY date or fact (e.g. a title, a join date, a name), always use the FIRST-PARTY version as the stated fact, and add a brief flag noting the conflict, e.g. "Eric Shute joined in 2023 (First-party: example.com/team); a secondary source implies a more recent hire date (Secondary: LinkedIn) — first-party date used." Never draw a conclusion or build an analytical point from the conflicting secondary claim itself — the conflict gets a one-line flag and nothing more.\n- Keep sourced facts (Company Bio, Recent Activity, and any named people in Buyer Persona) visibly distinct from your own analysis and inference (Strategic Focus, Competitive Positioning, Key Takeaways) — facts carry a citation, interpretive bullets don't need one but should read as analysis, not as confirmed fact.\n\nUsing this source material as your primary input, plus your own knowledge to fill gaps the sources above don't cover, generate a rigorous, analytically sharp Company Intelligence Brief. Go beyond surface-level description in every section — each bullet must deliver specific, actionable intelligence the reader could use immediately, not a generic summary.\n\nYou MUST write all six sections below in full, ending with a complete KEY TAKEAWAYS section — never truncate or stop early.\n\nIf the sources above and your own knowledge do not let you confidently identify a real, specific company matching "${company}" (for example the input looks like a random string, a typo, an internal code, or the sources are all unrelated), do NOT fabricate a brief. Instead, briefly explain in 1-3 sentences why "${company}" doesn't appear to correspond to an identifiable company, based on the sources above and your own knowledge, then continue directly into exactly this structure, with each header in plain text on its own line (no "#" markdown heading symbols):\n\nWHAT LIKELY HAPPENED\nRECOMMENDED NEXT STEPS\n\nWHAT LIKELY HAPPENED: 1-3 sentences on the most likely explanation (e.g. a typo, an internal code, a test input).\n\nRECOMMENDED NEXT STEPS: A bulleted list of 3-4 concrete next steps, using the "- **Label**: description" bold-label format below.\n\nDo not add a transitional line (like "here is what I can offer instead") between your opening explanation and the WHAT LIKELY HAPPENED header, and do not close with an offer to generate the brief once a corrected name is provided — end after the last bullet.\n\nOtherwise, if you can confidently identify the company, use these exact headers, each in plain text on its own line (no "#" markdown heading symbols, and no horizontal-rule lines like "---" between sections):\n\nCOMPANY BIO\nRECENT ACTIVITY\nSTRATEGIC FOCUS\nBUYER PERSONA\nCOMPETITIVE POSITIONING\nKEY TAKEAWAYS\n\nCOMPANY BIO: In 2-3 sentences, summarize what the company is and does, and how long it has been in existence (founding year if known).\n\nEach section below this point needs 3-4 bullets minimum.\n\nRECENT ACTIVITY: Identify concrete, specific initiatives, launches, announcements, or leadership moves from the sources above. Avoid generic observations like follower counts or award mentions unless they reveal a strategic signal. Every bullet should answer "so what does this mean for someone selling against or to them?"\n\nSTRATEGIC FOCUS: Identify the 3-4 dominant themes in their current messaging and positioning. Explain what each theme signals about where they are investing and where they may be vulnerable or stretched.\n\nBUYER PERSONA: Identify 3-4 distinct buyer types with specific titles, company contexts, and the core job-to-be-done each persona is trying to solve. Go beyond job titles to describe the mindset and pressure each buyer is under.\n\nCOMPETITIVE POSITIONING: Name 3-4 specific competitors and explain how ${company} differentiates against each. Identify at least one key vulnerability or positioning gap that a competitor could exploit.\n\nKEY TAKEAWAYS: Provide specific, opinionated takeaways a sales or marketing professional can act on immediately. Include at least one suggested question to ask prospects that surfaces a weakness or creates urgency.\n\nWhenever a section uses a bulleted list with a named item (a persona segment, a competitor, a channel, etc.), always bold the label with double asterisks and follow it with a colon, in this exact format: "- **Label**: description". Never use a dash or em-dash after the label, and never leave the label unbolded.\n\nBe specific, opinionated, and actionable throughout — favor concrete detail over broad statements.`
-      }]
-    })
-  });
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4096,
+        messages: [{
+          role: 'user',
+          content: `You are a senior competitive intelligence analyst briefing a sales or marketing professional ahead of a call or campaign targeting "${company}". You have two tiers of source material below.\n\n${sourceContext}\n\nSOURCE RULES (apply throughout the brief):\n- Treat FIRST-PARTY content as the authoritative source of truth for names, titles, founding date, and services. Use SECONDARY sources only to fill gaps FIRST-PARTY content doesn't cover, or to surface recent external news/signals FIRST-PARTY content wouldn't contain.\n- Copy job titles exactly as written on FIRST-PARTY pages, character for character. Never paraphrase, shorten, or invent a title — if the site says "Principal and Chief Investment Officer," do not write "CIO" or "Managing Principal" instead.\n- Every named person and every key fact (founding date, leadership titles, specific services) needs a short inline citation in parentheses immediately after it, in exactly this format: "(First-party: <citation>)" or "(Secondary: <SourceName>)" — using the exact citation references given alongside each source above. Never cite a fact without one of these two formats.\n- If a fact cannot be confirmed from the sources above or your own reliable knowledge, write "Unknown" or "Not confirmed" rather than guessing.\n- If a SECONDARY source conflicts with a FIRST-PARTY date or fact (e.g. a title, a join date, a name), always use the FIRST-PARTY version as the stated fact, and add a brief flag noting the conflict, e.g. "Eric Shute joined in 2023 (First-party: example.com/team); a secondary source implies a more recent hire date (Secondary: LinkedIn) — first-party date used." Never draw a conclusion or build an analytical point from the conflicting secondary claim itself — the conflict gets a one-line flag and nothing more.\n- Keep sourced facts (Company Bio, Recent Activity, and any named people in Buyer Persona) visibly distinct from your own analysis and inference (Strategic Focus, Competitive Positioning, Key Takeaways) — facts carry a citation, interpretive bullets don't need one but should read as analysis, not as confirmed fact.\n\nUsing this source material as your primary input, plus your own knowledge to fill gaps the sources above don't cover, generate a rigorous, analytically sharp Company Intelligence Brief. Go beyond surface-level description in every section — each bullet must deliver specific, actionable intelligence the reader could use immediately, not a generic summary.\n\nYou MUST write all six sections below in full, ending with a complete KEY TAKEAWAYS section — never truncate or stop early.\n\nIf the sources above and your own knowledge do not let you confidently identify a real, specific company matching "${company}" (for example the input looks like a random string, a typo, an internal code, or the sources are all unrelated), do NOT fabricate a brief. Instead, briefly explain in 1-3 sentences why "${company}" doesn't appear to correspond to an identifiable company, based on the sources above and your own knowledge, then continue directly into exactly this structure, with each header in plain text on its own line (no "#" markdown heading symbols):\n\nWHAT LIKELY HAPPENED\nRECOMMENDED NEXT STEPS\n\nWHAT LIKELY HAPPENED: 1-3 sentences on the most likely explanation (e.g. a typo, an internal code, a test input).\n\nRECOMMENDED NEXT STEPS: A bulleted list of 3-4 concrete next steps, using the "- **Label**: description" bold-label format below.\n\nDo not add a transitional line (like "here is what I can offer instead") between your opening explanation and the WHAT LIKELY HAPPENED header, and do not close with an offer to generate the brief once a corrected name is provided — end after the last bullet.\n\nOtherwise, if you can confidently identify the company, use these exact headers, each in plain text on its own line (no "#" markdown heading symbols, and no horizontal-rule lines like "---" between sections):\n\nCOMPANY BIO\nRECENT ACTIVITY\nSTRATEGIC FOCUS\nBUYER PERSONA\nCOMPETITIVE POSITIONING\nKEY TAKEAWAYS\n\nCOMPANY BIO: In 2-3 sentences, summarize what the company is and does, and how long it has been in existence (founding year if known).\n\nEach section below this point needs 3-4 bullets minimum.\n\nRECENT ACTIVITY: Identify concrete, specific initiatives, launches, announcements, or leadership moves from the sources above. Avoid generic observations like follower counts or award mentions unless they reveal a strategic signal. Every bullet should answer "so what does this mean for someone selling against or to them?"\n\nSTRATEGIC FOCUS: Identify the 3-4 dominant themes in their current messaging and positioning. Explain what each theme signals about where they are investing and where they may be vulnerable or stretched.\n\nBUYER PERSONA: Identify 3-4 distinct buyer types with specific titles, company contexts, and the core job-to-be-done each persona is trying to solve. Go beyond job titles to describe the mindset and pressure each buyer is under.\n\nCOMPETITIVE POSITIONING: Name 3-4 specific competitors and explain how ${company} differentiates against each. Identify at least one key vulnerability or positioning gap that a competitor could exploit.\n\nKEY TAKEAWAYS: Provide specific, opinionated takeaways a sales or marketing professional can act on immediately. Include at least one suggested question to ask prospects that surfaces a weakness or creates urgency.\n\nWhenever a section uses a bulleted list with a named item (a persona segment, a competitor, a channel, etc.), always bold the label with double asterisks and follow it with a colon, in this exact format: "- **Label**: description". Never use a dash or em-dash after the label, and never leave the label unbolded.\n\nBe specific, opinionated, and actionable throughout — favor concrete detail over broad statements.`
+        }]
+      })
+    });
 
-  const data = await response.json();
-  const text = data.content?.[0]?.text || 'No response received.';
-  res.status(200).json({ result: text });
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => '');
+      throw new Error(`Anthropic API error: ${response.status} ${errorBody.slice(0, 500)}`);
+    }
+
+    const data = await response.json();
+    const text = data.content?.[0]?.text || 'No response received.';
+    res.status(200).json({ result: text });
+  } catch (err) {
+    console.error('research handler error:', err);
+    res.status(502).json({ error: 'Failed to generate research brief' });
+  }
 }
